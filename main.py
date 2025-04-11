@@ -1,10 +1,13 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import random
 
 users = {}
 banned_users = set()
 trades = {}
+nicknames = {} 
+reverse_nicknames = {} 
+
 cases = {
     "case1": {
         "name": "Обычный кейс",
@@ -59,76 +62,237 @@ cases = {
             {"name": "AWP | Божественный дракон", "rarity": "Мифический", "price": 1500000},
             {"name": "Karambit | Небесный владыка", "rarity": "Мифический", "price": 2000000},
             {"name": "M9 Bayonet | Вечный огонь", "rarity": "Мифический", "price": 2500000},
-            {"name": "Нож | Адский пламень", "rarity": "Мифический", "price": 3000000},
-            {"name": "Перчатки | Ледяной король", "rarity": "Мифический", "price": 3500000},
-            {"name": "AWP | Вечный лед", "rarity": "Мифический", "price": 4000000},
-            {"name": "Karambit | Огненный демон", "rarity": "Мифический", "price": 4500000},
-            {"name": "M9 Bayonet | Лунный призрак", "rarity": "Мифический", "price": 5000000},
         ],
     },
 }
-leaderboard = {}
+promo_codes = {
+    "FREE100": 100,
+    "CSGODROP": 500,
+    "BIGMONEY": 1000,
+    "STEPAN": 99999,
+    "LEGENDARY": 5000
+}
+used_promo_codes = set()
+
 ADMIN_PASSWORD = "vadimka"
+
+WAITING_FOR_BAN = 1
+WAITING_FOR_UNBAN = 2
+WAITING_FOR_RESET = 3
+WAITING_FOR_NICKNAME = 4
+
+main_keyboard = ReplyKeyboardMarkup(
+    [["💰 Баланс", "📦 Кейсы"],
+     ["🎒 Инвентарь", "🎁 Промокод"],
+     ["🏆 Топ игроков", "📝 Сменить ник"]],
+    resize_keyboard=True
+)
+
+admin_keyboard = ReplyKeyboardMarkup(
+    [["🔨 Забанить", "🔓 Разбанить"],
+     ["💸 Сбросить деньги", "📊 Статистика"]],
+    resize_keyboard=True
+)
+
 
 def is_banned(user_id: int) -> bool:
     return user_id in banned_users
+
+
+def resolve_user_identifier(identifier: str):
+    try:
+        return int(identifier)
+    except ValueError:
+        return reverse_nicknames.get(identifier.lower())
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
     if is_banned(user_id):
         await update.message.reply_text("Вы забанены и не можете использовать бота.")
         return
+
     if user_id not in users:
         users[user_id] = {"balance": 1000, "skins": []}
-
-    commands = (
-        "/start - Начать игру\n"
-        "/cases - Открыть кейсы\n"
-        "/inventory - Показать инвентарь\n"
-        "/sell [номер скина] - Продать скин\n"
-        "/promo [ключ] - Активировать промокод\n"
-        "/trade [user_id] [номер скина] - Предложить обмен\n"
-        "/transfer [user_id] [сумма] - Перевести деньги\n"
-        "/who - Показать список команд"
-    )
+        default_nick = f"Игрок_{user_id % 1000:03d}"
+        nicknames[user_id] = default_nick
+        reverse_nicknames[default_nick.lower()] = user_id
 
     await update.message.reply_text(
-        f"Ваш ID: {user_id}\nДобро пожаловать! Ваш баланс: {users[user_id]['balance']}$\n\n"
-        f"Доступные команды:\n{commands}\n\n"
-        "Используйте /cases чтобы открыть кейсы."
+        f"👋 Добро пожаловать, {nicknames[user_id]}!\n"
+        f"💰 Ваш баланс: {users[user_id]['balance']}$\n"
+        f"🆔 Ваш ID: {user_id}\n"
+        f"📝 Ваш ник: {nicknames[user_id]}",
+        reply_markup=main_keyboard
     )
 
-async def who(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    commands = (
-        "/start - Начать игру\n"
-        "/cases - Открыть кейсы\n"
-        "/inventory - Показать инвентарь\n"
-        "/sell [номер скина] - Продать скин\n"
-        "/promo [ключ] - Активировать промокод\n"
-        "/trade [user_id] [номер скина] - Предложить обмен\n"
-        "/transfer [user_id] [сумма] - Перевести деньги\n"
-        "/who - Показать список команд"
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    text = update.message.text
+
+    if context.user_data.get('waiting_for') == WAITING_FOR_BAN:
+        await process_ban(update, context)
+        return
+    elif context.user_data.get('waiting_for') == WAITING_FOR_UNBAN:
+        await process_unban(update, context)
+        return
+    elif context.user_data.get('waiting_for') == WAITING_FOR_RESET:
+        await process_reset(update, context)
+        return
+    elif context.user_data.get('waiting_for') == WAITING_FOR_NICKNAME:
+        await process_nickname_change(update, context)
+        return
+
+    if text == "💰 Баланс":
+        await show_balance(update, context)
+    elif text == "📦 Кейсы":
+        await show_cases(update, context)
+    elif text == "🎒 Инвентарь":
+        await inventory(update, context)
+    elif text == "🎁 Промокод":
+        await update.message.reply_text("Введите промокод:")
+    elif text == "🏆 Топ игроков":
+        await show_leaderboard(update, context)
+    elif text == "📝 Сменить ник":
+        context.user_data['waiting_for'] = WAITING_FOR_NICKNAME
+        await update.message.reply_text("Введите новый никнейм (уникальный, без пробелов):")
+    elif text == "🔨 Забанить":
+        context.user_data['waiting_for'] = WAITING_FOR_BAN
+        await update.message.reply_text("Введите ID или ник пользователя для бана:")
+    elif text == "🔓 Разбанить":
+        context.user_data['waiting_for'] = WAITING_FOR_UNBAN
+        await update.message.reply_text("Введите ID или ник пользователя для разбана:")
+    elif text == "💸 Сбросить деньги":
+        context.user_data['waiting_for'] = WAITING_FOR_RESET
+        await update.message.reply_text("Введите ID или ник пользователя для сброса денег и инвентаря:")
+    elif text == "📊 Статистика":
+        await show_admin_stats(update, context)
+    elif text in promo_codes:
+        await activate_promo(update, context)
+    else:
+        await update.message.reply_text("Используйте кнопки для навигации", reply_markup=main_keyboard)
+
+
+async def process_nickname_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    new_nick = update.message.text.strip()
+
+    if not new_nick:
+        await update.message.reply_text("Никнейм не может быть пустым!")
+        return
+
+    if len(new_nick) > 20:
+        await update.message.reply_text("Никнейм слишком длинный (макс. 20 символов)!")
+        return
+
+    if ' ' in new_nick:
+        await update.message.reply_text("Никнейм не должен содержать пробелов!")
+        return
+
+    if new_nick.lower() in reverse_nicknames and reverse_nicknames[new_nick.lower()] != user_id:
+        await update.message.reply_text("Этот никнейм уже занят!")
+        return
+
+    if user_id in nicknames:
+        old_nick = nicknames[user_id]
+        if old_nick.lower() in reverse_nicknames:
+            del reverse_nicknames[old_nick.lower()]
+
+    nicknames[user_id] = new_nick
+    reverse_nicknames[new_nick.lower()] = user_id
+
+    await update.message.reply_text(
+        f"✅ Ваш никнейм изменен на: {new_nick}",
+        reply_markup=main_keyboard
     )
-    await update.message.reply_text(f"Доступные команды:\n{commands}")
+    context.user_data['waiting_for'] = None
+
+
+async def process_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    identifier = update.message.text.strip()
+    target_id = resolve_user_identifier(identifier)
+
+    if not target_id:
+        await update.message.reply_text("❌ Пользователь не найден! Проверьте ID или никнейм.")
+    else:
+        banned_users.add(target_id)
+        target_nick = nicknames.get(target_id, f"ID:{target_id}")
+        await update.message.reply_text(
+            f"🔨 Пользователь {target_nick} (ID:{target_id}) забанен.",
+            reply_markup=admin_keyboard
+        )
+
+    context.user_data['waiting_for'] = None
+
+
+async def process_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    identifier = update.message.text.strip()
+    target_id = resolve_user_identifier(identifier)
+
+    if not target_id:
+        await update.message.reply_text("❌ Пользователь не найден! Проверьте ID или никнейм.")
+    else:
+        banned_users.discard(target_id)
+        target_nick = nicknames.get(target_id, f"ID:{target_id}")
+        await update.message.reply_text(
+            f"🔓 Пользователь {target_nick} (ID:{target_id}) разбанен.",
+            reply_markup=admin_keyboard
+        )
+
+    context.user_data['waiting_for'] = None
+
+
+async def process_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    identifier = update.message.text.strip()
+    target_id = resolve_user_identifier(identifier)
+
+    if not target_id:
+        await update.message.reply_text("❌ Пользователь не найден! Проверьте ID или никнейм.")
+    elif target_id not in users:
+        await update.message.reply_text("❌ Пользователь не зарегистрирован в системе.")
+    else:
+        users[target_id]["balance"] = 0
+        users[target_id]["skins"] = []
+        target_nick = nicknames.get(target_id, f"ID:{target_id}")
+        await update.message.reply_text(
+            f"💸 Деньги и инвентарь пользователя {target_nick} (ID:{target_id}) сброшены.",
+            reply_markup=admin_keyboard
+        )
+
+    context.user_data['waiting_for'] = None
+
+
+async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    if user_id not in users:
+        await update.message.reply_text("Сначала начните игру с помощью /start")
+        return
+
+    await update.message.reply_text(
+        f"💰 Ваш баланс: {users[user_id]['balance']}$",
+        reply_markup=main_keyboard
+    )
+
 
 async def show_cases(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
-    if is_banned(user_id):
-        await update.message.reply_text("Вы забанены и не можете использовать бота.")
+    if user_id not in users:
+        await update.message.reply_text("Сначала начните игру с помощью /start")
         return
+
     keyboard = [
-        [InlineKeyboardButton(case["name"], callback_data=case_id)] for case_id, case in cases.items()
+        [InlineKeyboardButton(f"{case['name']} - {case['price']}$", callback_data=case_id)]
+        for case_id, case in cases.items()
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выберите кейс:", reply_markup=reply_markup)
+    await update.message.reply_text("🎲 Выберите кейс:", reply_markup=reply_markup)
+
 
 async def case_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if is_banned(user_id):
-        await query.edit_message_text("Вы забанены и не можете использовать бота.")
-        return
 
     case_id = query.data
     if case_id not in cases:
@@ -141,37 +305,41 @@ async def case_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         skin = random.choice(case["skins"])
         users[user_id]["skins"].append(skin)
         await query.edit_message_text(
-            f"Вы открыли {case['name']} и получили: {skin['name']} ({skin['rarity']})\nЦена продажи: {skin['price']}$\nВаш баланс: {users[user_id]['balance']}$"
+            f"🎉 Вы открыли {case['name']} и получили:\n"
+            f"🔫 {skin['name']} ({skin['rarity']})\n"
+            f"💵 Цена продажи: {skin['price']}$\n"
+            f"💰 Ваш баланс: {users[user_id]['balance']}$"
         )
     else:
-        await query.edit_message_text("Недостаточно средств для открытия этого кейса.")
+        await query.edit_message_text("❌ Недостаточно средств для открытия этого кейса.")
+
 
 async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
-    if is_banned(user_id):
-        await update.message.reply_text("Вы забанены и не можете использовать бота.")
+    if user_id not in users:
+        await update.message.reply_text("Сначала начните игру с помощью /start")
         return
-    if user_id in users:
-        if users[user_id]["skins"]:
-            skins = "\n".join(
-                [f"{i+1}. {skin['name']} ({skin['rarity']}) - Цена продажи: {skin['price']}$"
-                 for i, skin in enumerate(users[user_id]["skins"])]
-            )
-            await update.message.reply_text(
-                f"Ваши скины (используйте номер для продажи через /sell [номер]):\n{skins}"
-            )
-        else:
-            await update.message.reply_text("У вас нет скинов.")
-    else:
-        await update.message.reply_text("Вы еще не начали игру. Используйте /start.")
+
+    if not users[user_id]["skins"]:
+        await update.message.reply_text("🎒 Ваш инвентарь пуст.")
+        return
+
+    skins_list = "\n".join(
+        f"{i + 1}. {skin['name']} ({skin['rarity']}) - 💵 {skin['price']}$"
+        for i, skin in enumerate(users[user_id]["skins"])
+    )
+
+    await update.message.reply_text(
+        f"🎒 Ваши скины:\n{skins_list}\n\n"
+        "Чтобы продать скин, введите /sell [номер]",
+        reply_markup=main_keyboard
+    )
+
 
 async def sell_skin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
-    if is_banned(user_id):
-        await update.message.reply_text("Вы забанены и не можете использовать бота.")
-        return
     if user_id not in users:
-        await update.message.reply_text("Вы еще не начали игру. Используйте /start.")
+        await update.message.reply_text("Сначала начните игру с помощью /start")
         return
 
     if not context.args:
@@ -184,241 +352,108 @@ async def sell_skin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             skin = users[user_id]["skins"].pop(skin_index)
             users[user_id]["balance"] += skin["price"]
             await update.message.reply_text(
-                f"Вы продали {skin['name']} за {skin['price']}$.\n"
-                f"Ваш баланс: {users[user_id]['balance']}$"
+                f"✅ Вы продали {skin['name']} за {skin['price']}$.\n"
+                f"💰 Ваш баланс: {users[user_id]['balance']}$",
+                reply_markup=main_keyboard
             )
         else:
-            await update.message.reply_text("Неверный номер скина.")
+            await update.message.reply_text("❌ Неверный номер скина.")
     except ValueError:
-        await update.message.reply_text("Номер скина должен быть числом.")
+        await update.message.reply_text("❌ Номер скина должен быть числом.")
 
-async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+async def activate_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
-    if is_banned(user_id):
-        await update.message.reply_text("Вы забанены и не можете использовать бота.")
+    promo_code = update.message.text.upper()
+
+    if user_id not in users:
+        await update.message.reply_text("Сначала начните игру с помощью /start")
         return
 
-    if len(context.args) < 2:
-        await update.message.reply_text("Использование: /trade [user_id] [номер скина]")
+    if promo_code in used_promo_codes:
+        await update.message.reply_text("❌ Этот промокод уже был использован!")
         return
 
-    try:
-        target_user_id = int(context.args[0])
-        skin_index = int(context.args[1]) - 1
-
-        if target_user_id not in users:
-            await update.message.reply_text("Пользователь не найден.")
-            return
-
-        if skin_index < 0 or skin_index >= len(users[user_id]["skins"]):
-            await update.message.reply_text("Неверный номер скина.")
-            return
-
-        trades[target_user_id] = {
-            "from_user_id": user_id,
-            "skin": users[user_id]["skins"][skin_index],
-        }
-
+    if promo_code in promo_codes:
+        reward = promo_codes[promo_code]
+        users[user_id]["balance"] += reward
+        used_promo_codes.add(promo_code)
         await update.message.reply_text(
-            f"Вы предложили обмен пользователю {target_user_id}.\n"
-            f"Скин: {users[user_id]['skins'][skin_index]['name']} ({users[user_id]['skins'][skin_index]['rarity']})"
+            f"🎉 Промокод активирован! Вы получили {reward}$\n"
+            f"💰 Ваш баланс: {users[user_id]['balance']}$",
+            reply_markup=main_keyboard
         )
+    else:
+        await update.message.reply_text("❌ Неверный промокод!")
 
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=f"Пользователь {user_id} предложил вам обмен:\n"
-                 f"Скин: {users[user_id]['skins'][skin_index]['name']} ({users[user_id]['skins'][skin_index]['rarity']})\n"
-                 f"Используйте /accept_trade чтобы принять или /decline_trade чтобы отклонить."
-        )
 
-    except ValueError:
-        await update.message.reply_text("Некорректные данные. Убедитесь, что user_id и номер скина введены правильно.")
-
-async def accept_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.message.from_user.id
-    if user_id not in trades:
-        await update.message.reply_text("У вас нет активных предложений обмена.")
+async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not users:
+        await update.message.reply_text("Пока нет игроков в таблице лидеров.")
         return
 
-    trade_data = trades.pop(user_id)
-    from_user_id = trade_data["from_user_id"]
-    skin = trade_data["skin"]
+    sorted_users = sorted(users.items(), key=lambda x: x[1]["balance"], reverse=True)
 
-    users[user_id]["skins"].append(skin)
-    users[from_user_id]["skins"].remove(skin)
+    leaderboard_text = "🏆 Топ игроков:\n\n"
+    for i, (user_id, data) in enumerate(sorted_users[:10], 1):
+        nick = nicknames.get(user_id, f"ID:{user_id}")
+        leaderboard_text += f"{i}. {nick} - 💰 {data['balance']}$\n"
 
-    await update.message.reply_text(f"Вы приняли обмен. Скин {skin['name']} теперь ваш.")
-    await context.bot.send_message(
-        chat_id=from_user_id,
-        text=f"Пользователь {user_id} принял ваш обмен. Скин {skin['name']} передан."
-    )
+    await update.message.reply_text(leaderboard_text, reply_markup=main_keyboard)
 
-async def decline_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.message.from_user.id
-    if user_id not in trades:
-        await update.message.reply_text("У вас нет активных предложений обмена.")
+
+async def show_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not users:
+        await update.message.reply_text("Нет зарегистрированных игроков.")
         return
 
-    trade_data = trades.pop(user_id)
-    from_user_id = trade_data["from_user_id"]
-    skin = trade_data["skin"]
+    total_players = len(users)
+    total_skins = sum(len(user["skins"]) for user in users.values())
+    total_balance = sum(user["balance"] for user in users.values())
 
-    await update.message.reply_text(f"Вы отклонили обмен с пользователем {from_user_id}.")
-    await context.bot.send_message(
-        chat_id=from_user_id,
-        text=f"Пользователь {user_id} отклонил ваш обмен."
+    stats_text = (
+        "📊 Статистика сервера:\n\n"
+        f"👥 Игроков: {total_players}\n"
+        f"🎒 Всего скинов: {total_skins}\n"
+        f"💰 Общий баланс: {total_balance}$\n"
+        f"🔨 Забанено: {len(banned_users)}"
     )
+
+    await update.message.reply_text(stats_text, reply_markup=admin_keyboard)
+
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.args and context.args[0] == ADMIN_PASSWORD:
         user_id = update.message.from_user.id
-        users[user_id]["balance"] = float("inf")  # Бесконечные деньги
-        await update.message.reply_text(
-            "Режим администратора активирован. У вас теперь бесконечные деньги.\n"
-            "Используйте /give_skin [user_id] [skin] чтобы выдать скин.\n"
-            "Используйте /transfer [user_id] [сумма] чтобы перевести деньги.\n"
-            "Используйте /ban [user_id] чтобы забанить пользователя.\n"
-            "Используйте /unban [user_id] чтобы разбанить пользователя.\n"
-            "Используйте /bankrupt [user_id] чтобы обанкротить пользователя.\n"
-            "Используйте /leaderboard чтобы посмотреть таблицу игроков."
-        )
-    else:
-        await update.message.reply_text("Неверный пароль.")
-
-async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.message.from_user.id
-    if context.args and context.args[0] == ADMIN_PASSWORD:
-        if not users:
-            await update.message.reply_text("Нет зарегистрированных игроков.")
-            return
-
-        leaderboard_text = "Таблица игроков:\n"
-        for uid, data in users.items():
-            leaderboard_text += (
-                f"ID: {uid}\n"
-                f"Баланс: {data['balance']}$\n"
-                f"Количество скинов: {len(data['skins'])}\n"
-                "----------------\n"
-            )
-        await update.message.reply_text(leaderboard_text)
-    else:
-        await update.message.reply_text("Неверный пароль.")
-
-async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Использование: /ban [user_id]")
-        return
-    try:
-        user_id = int(context.args[0])
-        banned_users.add(user_id)
-        await update.message.reply_text(f"Пользователь {user_id} забанен.")
-    except ValueError:
-        await update.message.reply_text("Некорректный user_id.")
-
-async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Использование: /unban [user_id]")
-        return
-    try:
-        user_id = int(context.args[0])
-        banned_users.discard(user_id)
-        await update.message.reply_text(f"Пользователь {user_id} разбанен.")
-    except ValueError:
-        await update.message.reply_text("Некорректный user_id.")
-
-async def bankrupt_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Использование: /bankrupt [user_id]")
-        return
-    try:
-        user_id = int(context.args[0])
-        if user_id in users:
-            users[user_id]["balance"] = 0
-            users[user_id]["skins"] = []
-            await update.message.reply_text(f"Пользователь {user_id} обанкрочен.")
+        if user_id not in users:
+            users[user_id] = {"balance": float("inf"), "skins": []}
+            nicknames[user_id] = f"Админ_{user_id % 1000:03d}"
+            reverse_nicknames[nicknames[user_id].lower()] = user_id
         else:
-            await update.message.reply_text("Пользователь не найден.")
-    except ValueError:
-        await update.message.reply_text("Некорректный user_id.")
-
-async def promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.message.from_user.id
-    if is_banned(user_id):
-        await update.message.reply_text("Вы забанены и не можете использовать бота.")
-        return
-    if context.args and context.args[0] == "key":
-        users[user_id]["balance"] += 10000
-        await update.message.reply_text(f"Промокод активирован! Ваш баланс: {users[user_id]['balance']}$")
-    elif context.args and context.args[0] == "STEPAN":
-        users[user_id]["balance"] += 99999
-        await update.message.reply_text(f"Промокод активирован! Ваш баланс: {users[user_id]['balance']}$")
-    else:
-        await update.message.reply_text("Неверный промокод.")
-
-async def transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.message.from_user.id
-    if is_banned(user_id):
-        await update.message.reply_text("Вы забанены и не можете использовать бота.")
-        return
-
-    if len(context.args) < 2:
-        await update.message.reply_text("Использование: /transfer [user_id] [сумма]")
-        return
-
-    try:
-        target_user_id = int(context.args[0])
-        amount = float(context.args[1])
-
-        if target_user_id not in users:
-            await update.message.reply_text("Пользователь не найден.")
-            return
-
-        if amount <= 0:
-            await update.message.reply_text("Сумма должна быть больше нуля.")
-            return
-
-        if users[user_id]["balance"] < amount:
-            await update.message.reply_text("Недостаточно средств для перевода.")
-            return
-
-        users[user_id]["balance"] -= amount
-        users[target_user_id]["balance"] += amount
+            users[user_id]["balance"] = float("inf")
 
         await update.message.reply_text(
-            f"Вы перевели {amount}$ пользователю {target_user_id}.\n"
-            f"Ваш новый баланс: {users[user_id]['balance']}$"
+            "🔑 Режим администратора активирован!\n"
+            "💰 У вас теперь бесконечные деньги.",
+            reply_markup=admin_keyboard
         )
+    else:
+        await update.message.reply_text("❌ Неверный пароль!")
 
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=f"Пользователь {user_id} перевел вам {amount}$.\n"
-                    f"Ваш новый баланс: {users[target_user_id]['balance']}$"
-        )
-
-    except ValueError:
-        await update.message.reply_text("Некорректные данные. Убедитесь, что user_id и сумма введены правильно.")
 
 def main() -> None:
-    application = Application.builder().token("7771249533:AAG3hA9pTgbeuCIkHqTdLYu8WSElIu2EIm8").build()
+    application = Application.builder().token("8165670310:AAGeisjMnyf-BHwJxibiJvBHjoOXPOtK9jc").build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("who", who))
-    application.add_handler(CommandHandler("cases", show_cases))
-    application.add_handler(CallbackQueryHandler(case_selected))
-    application.add_handler(CommandHandler("inventory", inventory))
-    application.add_handler(CommandHandler("sell", sell_skin))
     application.add_handler(CommandHandler("admin", admin))
-    application.add_handler(CommandHandler("ban", ban_user))
-    application.add_handler(CommandHandler("unban", unban_user))
-    application.add_handler(CommandHandler("bankrupt", bankrupt_user))
-    application.add_handler(CommandHandler("promo", promo))
-    application.add_handler(CommandHandler("trade", trade))
-    application.add_handler(CommandHandler("accept_trade", accept_trade))
-    application.add_handler(CommandHandler("decline_trade", decline_trade))
-    application.add_handler(CommandHandler("leaderboard", leaderboard_command))
-    application.add_handler(CommandHandler("transfer", transfer))  # Добавлена команда /transfer
+    application.add_handler(CommandHandler("sell", sell_skin))
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    application.add_handler(CallbackQueryHandler(case_selected))
 
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
